@@ -10,7 +10,7 @@ use tracing::{info, warn, error};
 use crate::{
     arbitrage::detector::Opportunity,
     config::Config,
-    utils::{jito, jupiter, rpc::{self, BlockhashCache}},
+    utils::{jito, jupiter, rpc::{self, BlockhashCache}, stats::LatencyStats},
 };
 
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -21,6 +21,7 @@ pub async fn execute(
     config:    &Config,
     opp:       &Opportunity,
     bh_cache:  &Arc<BlockhashCache>,
+    stats:     &Arc<LatencyStats>,
 ) -> Result<bool> {
     let t0         = Instant::now();
     let pubkey     = wallet.pubkey();
@@ -47,6 +48,7 @@ pub async fn execute(
         bh_future,
     )?;
     let ms_q1 = t0.elapsed().as_millis();
+    stats.record("q1_ms", ms_q1 as u64);
 
     if lamports < config.trade_lamports + config.reserve_lamports {
         warn!(
@@ -60,11 +62,11 @@ pub async fn execute(
     // Phase 2: quote2 (sequential — needs q1.out_amount)
     let q2 = jupiter::get_quote(client, mid_mint, SOL_MINT, q1.out_amount, 50, api_key).await?;
     let ms_q2 = t0.elapsed().as_millis();
+    stats.record("q2_ms", (ms_q2 - ms_q1) as u64);
 
-    let gross      = q2.out_amount as i64 - config.trade_lamports as i64;
-    // Pay 65% of gross as tip — competitive on high-contention pairs.
-    // Floor from config ensures we don't bid zero on tiny spreads.
-    let tip        = (config.jito_tip_lamports as i64).max(gross * 65 / 100);
+    let gross = q2.out_amount as i64 - config.trade_lamports as i64;
+    let tip   = (config.jito_tip_lamports as i64)
+                    .max(gross * config.tip_pct as i64 / 100);
     let net_profit = gross - tip;
 
     info!(
@@ -78,8 +80,13 @@ pub async fn execute(
         "Quote check"
     );
 
-    if net_profit <= 0 {
-        info!(elapsed_ms = ms_q2, "No profit after Jito tip, skipping");
+    if net_profit < config.min_net_lamports {
+        info!(
+            elapsed_ms  = ms_q2,
+            net_lamports = net_profit,
+            threshold    = config.min_net_lamports,
+            "Below profit threshold, skipping"
+        );
         return Ok(false);
     }
 
@@ -90,6 +97,7 @@ pub async fn execute(
     )?;
     let ms_build    = t0.elapsed().as_millis();
     let tx_build_ms = ms_build - ms_q2;
+    stats.record("build_ms", tx_build_ms as u64);
 
     // If Jupiter swap API was slow, the opportunity is almost certainly gone.
     // Skip rather than waste a tip and compete on stale data.
@@ -117,6 +125,8 @@ pub async fn execute(
     ).await?;
     let ms_submit = t_submit.elapsed().as_millis();
     let ms_total  = t0.elapsed().as_millis();
+    stats.record("submit_ms", ms_submit as u64);
+    stats.record("total_ms",  ms_total  as u64);
 
     info!(
         bundle_id = %bundle_id,

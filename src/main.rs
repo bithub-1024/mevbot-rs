@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 use arbitrage::{detector::Detector, executor};
 use config::{load_wallet, Config};
 use pools::monitor;
-use utils::rpc::{self, BlockhashCache};
+use utils::{rpc::{self, BlockhashCache}, stats::LatencyStats};
 
 struct ExecGuard {
     executing:     bool,
@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config::from_env()?);
     let wallet = Arc::new(load_wallet()?);
+    let stats  = LatencyStats::new();
 
     let client = Arc::new(
         Client::builder()
@@ -58,10 +59,12 @@ async fn main() -> Result<()> {
 
     let balance = rpc::get_balance(&client, &config.rpc_url, &config.rpc_host, &wallet.pubkey()).await?;
     info!(
-        wallet     = %wallet.pubkey(),
-        sol        = balance as f64 / 1e9,
-        trade_sol  = config.trade_lamports as f64 / 1e9,
-        min_spread = config.min_spread_bps,
+        wallet           = %wallet.pubkey(),
+        sol              = balance as f64 / 1e9,
+        trade_sol        = config.trade_lamports as f64 / 1e9,
+        min_spread       = config.min_spread_bps,
+        tip_pct          = config.tip_pct,
+        min_net_lamports = config.min_net_lamports,
         "Bot started"
     );
 
@@ -112,89 +115,108 @@ async fn main() -> Result<()> {
 
     const COOLDOWN: Duration = Duration::from_millis(500);
 
-    while let Some(event) = price_rx.recv().await {
-        if last_stats.elapsed() >= Duration::from_secs(60) {
-            info!(
-                opps     = opps,
-                cooldown = cooldown,
-                checked  = checked,
-                executed = stat_executed.load(Ordering::Relaxed),
-                failed   = stat_failed.load(Ordering::Relaxed),
-                "Stats"
-            );
-            detector.lock().log_prices();
-            last_stats = Instant::now();
-        }
-
-        let opp = {
-            let mut det = detector.lock();
-            det.on_price(&event)
-        };
-
-        let opp = match opp {
-            None => continue,
-            Some(o) if o.spread_bps < config.min_spread_bps => continue,
-            Some(o) => o,
-        };
-
-        opps += 1;
-
-        {
-            let guard = exec_guard.lock();
-            if guard.executing
-                || guard.last_exec.elapsed() < COOLDOWN
-                || Instant::now() < guard.jup_backoff
-            {
-                cooldown += 1;
-                continue;
+    loop {
+        tokio::select! {
+            // Graceful shutdown on Ctrl-C: print latency report then exit.
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutting down");
+                stats.print_report();
+                return Ok(());
             }
-        }
 
-        checked += 1;
-        info!(
-            sell = opp.sell_pool.name,
-            buy  = opp.buy_pool.name,
-            bps  = opp.spread_bps,
-            "Opportunity → checking Jupiter"
-        );
+            maybe_event = price_rx.recv() => {
+                let event = match maybe_event {
+                    None    => break,
+                    Some(e) => e,
+                };
 
-        {
-            let config   = Arc::clone(&config);
-            let wallet   = Arc::clone(&wallet);
-            let client   = Arc::clone(&client);
-            let guard    = Arc::clone(&exec_guard);
-            let executed = Arc::clone(&stat_executed);
-            let failed   = Arc::clone(&stat_failed);
-            let bh_cache = Arc::clone(&bh_cache);
-
-            exec_guard.lock().executing = true;
-
-            tokio::spawn(async move {
-                let result = executor::execute(&client, &wallet, &config, &opp, &bh_cache).await;
-                {
-                    let mut g = guard.lock();
-                    g.executing = false;
-                    g.last_exec = Instant::now();
+                if last_stats.elapsed() >= Duration::from_secs(60) {
+                    info!(
+                        opps     = opps,
+                        cooldown = cooldown,
+                        checked  = checked,
+                        executed = stat_executed.load(Ordering::Relaxed),
+                        failed   = stat_failed.load(Ordering::Relaxed),
+                        "Stats"
+                    );
+                    detector.lock().log_prices();
+                    last_stats = Instant::now();
                 }
-                match result {
-                    Ok(true)  => { executed.fetch_add(1, Ordering::Relaxed); }
-                    Ok(false) => {}
-                    Err(e)    => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        let msg = e.to_string();
-                        if msg.contains("429") {
-                            // Back off 30s so we stop hammering Jupiter while rate-limited.
-                            let backoff = Instant::now() + Duration::from_secs(30);
-                            guard.lock().jup_backoff = backoff;
-                            warn!("Jupiter rate-limited — pausing 30s");
-                        } else {
-                            error!("Execute error: {e}");
-                        }
+
+                let opp = {
+                    let mut det = detector.lock();
+                    det.on_price(&event)
+                };
+
+                let opp = match opp {
+                    None => continue,
+                    Some(o) if o.spread_bps < config.min_spread_bps => continue,
+                    Some(o) => o,
+                };
+
+                opps += 1;
+
+                {
+                    let guard = exec_guard.lock();
+                    if guard.executing
+                        || guard.last_exec.elapsed() < COOLDOWN
+                        || Instant::now() < guard.jup_backoff
+                    {
+                        cooldown += 1;
+                        continue;
                     }
                 }
-            });
+
+                checked += 1;
+                info!(
+                    sell = opp.sell_pool.name,
+                    buy  = opp.buy_pool.name,
+                    bps  = opp.spread_bps,
+                    "Opportunity → checking Jupiter"
+                );
+
+                {
+                    let config   = Arc::clone(&config);
+                    let wallet   = Arc::clone(&wallet);
+                    let client   = Arc::clone(&client);
+                    let guard    = Arc::clone(&exec_guard);
+                    let executed = Arc::clone(&stat_executed);
+                    let failed   = Arc::clone(&stat_failed);
+                    let bh_cache = Arc::clone(&bh_cache);
+                    let stats    = Arc::clone(&stats);
+
+                    exec_guard.lock().executing = true;
+
+                    tokio::spawn(async move {
+                        let result = executor::execute(
+                            &client, &wallet, &config, &opp, &bh_cache, &stats,
+                        ).await;
+                        {
+                            let mut g = guard.lock();
+                            g.executing = false;
+                            g.last_exec = Instant::now();
+                        }
+                        match result {
+                            Ok(true)  => { executed.fetch_add(1, Ordering::Relaxed); }
+                            Ok(false) => {}
+                            Err(e)    => {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                let msg = e.to_string();
+                                if msg.contains("429") {
+                                    let backoff = Instant::now() + Duration::from_secs(30);
+                                    guard.lock().jup_backoff = backoff;
+                                    warn!("Jupiter rate-limited — pausing 30s");
+                                } else {
+                                    error!("Execute error: {e}");
+                                }
+                            }
+                        }
+                    });
+                }
+            }
         }
     }
 
+    stats.print_report();
     Ok(())
 }
