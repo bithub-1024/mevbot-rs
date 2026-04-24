@@ -25,8 +25,10 @@ use pools::monitor;
 use utils::rpc::{self, BlockhashCache};
 
 struct ExecGuard {
-    executing: bool,
-    last_exec: Instant,
+    executing:     bool,
+    last_exec:     Instant,
+    /// Set to a future Instant when Jupiter rate-limits us; blocks all attempts until then.
+    jup_backoff:   Instant,
 }
 
 #[tokio::main]
@@ -94,8 +96,9 @@ async fn main() -> Result<()> {
     }
 
     let exec_guard = Arc::new(Mutex::new(ExecGuard {
-        executing: false,
-        last_exec: Instant::now() - Duration::from_secs(60),
+        executing:   false,
+        last_exec:   Instant::now() - Duration::from_secs(60),
+        jup_backoff: Instant::now() - Duration::from_secs(60),
     }));
     let detector = Arc::new(Mutex::new(Detector::new()));
 
@@ -138,7 +141,10 @@ async fn main() -> Result<()> {
 
         {
             let guard = exec_guard.lock();
-            if guard.executing || guard.last_exec.elapsed() < COOLDOWN {
+            if guard.executing
+                || guard.last_exec.elapsed() < COOLDOWN
+                || Instant::now() < guard.jup_backoff
+            {
                 cooldown += 1;
                 continue;
             }
@@ -175,7 +181,15 @@ async fn main() -> Result<()> {
                     Ok(false) => {}
                     Err(e)    => {
                         failed.fetch_add(1, Ordering::Relaxed);
-                        error!("Execute error: {e}");
+                        let msg = e.to_string();
+                        if msg.contains("429") {
+                            // Back off 30s so we stop hammering Jupiter while rate-limited.
+                            let backoff = Instant::now() + Duration::from_secs(30);
+                            guard.lock().jup_backoff = backoff;
+                            warn!("Jupiter rate-limited — pausing 30s");
+                        } else {
+                            error!("Execute error: {e}");
+                        }
                     }
                 }
             });

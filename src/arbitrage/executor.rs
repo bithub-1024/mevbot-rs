@@ -88,12 +88,20 @@ pub async fn execute(
         jupiter::build_swap_tx(client, &q1.raw, &pubkey_str, config.priority_fee, api_key, blockhash),
         jupiter::build_swap_tx(client, &q2.raw, &pubkey_str, config.priority_fee, api_key, blockhash),
     )?;
-    let ms_build = t0.elapsed().as_millis();
+    let ms_build    = t0.elapsed().as_millis();
+    let tx_build_ms = ms_build - ms_q2;
+
+    // If Jupiter swap API was slow, the opportunity is almost certainly gone.
+    // Skip rather than waste a tip and compete on stale data.
+    if tx_build_ms > 300 {
+        warn!(tx_build_ms, "Jupiter swap build too slow — skipping stale bundle");
+        return Ok(false);
+    }
 
     info!(
         net_sol             = net_profit as f64 / 1e9,
         tip_lamports        = tip,
-        build_ms            = ms_build - ms_q2,
+        build_ms            = tx_build_ms,
         total_pre_submit_ms = ms_build,
         "Submitting Jito bundle"
     );
