@@ -30,10 +30,21 @@ pub async fn execute(
     let sol_is_a = opp.sell_pool.token_a == SOL_MINT;
     let mid_mint = if sol_is_a { opp.sell_pool.token_b } else { opp.sell_pool.token_a };
 
-    // Phase 1: balance check + quote1 in parallel
-    let (lamports, q1) = tokio::try_join!(
+    // Phase 1: balance check + quote1 + blockhash in parallel
+    let bh_future = {
+        let client   = client.clone();
+        let url      = config.rpc_url.clone();
+        let rpc_host = config.rpc_host.clone();
+        let cache    = Arc::clone(bh_cache);
+        async move {
+            if let Some(h) = cache.get_fresh() { return Ok::<_, anyhow::Error>(h); }
+            rpc::get_latest_blockhash(&client, &url, &rpc_host).await
+        }
+    };
+    let (lamports, q1, blockhash) = tokio::try_join!(
         rpc::get_balance(client, &config.rpc_url, &config.rpc_host, &pubkey),
         jupiter::get_quote(client, SOL_MINT, mid_mint, config.trade_lamports, 50, api_key),
+        bh_future,
     )?;
     let ms_q1 = t0.elapsed().as_millis();
 
@@ -51,7 +62,9 @@ pub async fn execute(
     let ms_q2 = t0.elapsed().as_millis();
 
     let gross      = q2.out_amount as i64 - config.trade_lamports as i64;
-    let tip        = (config.jito_tip_lamports as i64).max(gross * 3 / 10);
+    // Pay 65% of gross as tip — competitive on high-contention pairs.
+    // Floor from config ensures we don't bid zero on tiny spreads.
+    let tip        = (config.jito_tip_lamports as i64).max(gross * 65 / 100);
     let net_profit = gross - tip;
 
     info!(
@@ -70,24 +83,10 @@ pub async fn execute(
         return Ok(false);
     }
 
-    // Phase 3: build both swap txs in parallel + blockhash from cache (or RPC fallback)
-    let bh_future = {
-        let client   = client.clone();
-        let url      = config.rpc_url.clone();
-        let rpc_host = config.rpc_host.clone();
-        let cache    = Arc::clone(bh_cache);
-        async move {
-            if let Some(h) = cache.get_fresh() {
-                return Ok::<_, anyhow::Error>(h);
-            }
-            rpc::get_latest_blockhash(&client, &url, &rpc_host).await
-        }
-    };
-
-    let (tx1, tx2, blockhash) = tokio::try_join!(
-        jupiter::build_swap_tx(client, &q1.raw, &pubkey_str, config.priority_fee, api_key),
-        jupiter::build_swap_tx(client, &q2.raw, &pubkey_str, config.priority_fee, api_key),
-        bh_future,
+    // Phase 3: build both swap txs in parallel — blockhash already fetched in phase 1
+    let (tx1, tx2) = tokio::try_join!(
+        jupiter::build_swap_tx(client, &q1.raw, &pubkey_str, config.priority_fee, api_key, blockhash),
+        jupiter::build_swap_tx(client, &q2.raw, &pubkey_str, config.priority_fee, api_key, blockhash),
     )?;
     let ms_build = t0.elapsed().as_millis();
 

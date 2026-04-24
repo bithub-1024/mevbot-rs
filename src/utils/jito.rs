@@ -49,8 +49,9 @@ fn encode_tx(tx: &VersionedTransaction) -> Result<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
-/// Sign all txs with the provided blockhash, append tip tx, then submit the bundle
+/// Sign all txs with the wallet key, append tip tx, then submit the bundle
 /// to all Jito endpoints in parallel — returns on first success.
+/// Swap txs must already have the correct blockhash embedded (via Jupiter's blockhashStr).
 pub async fn send_bundle(
     client:       &Client,
     wallet:       &Keypair,
@@ -59,12 +60,9 @@ pub async fn send_bundle(
     tip_lamports: u64,
     blockhash:    Hash,
 ) -> Result<(String, String)> {
-    // Re-sign all transactions with provided blockhash
+    // Sign swap transactions — blockhash already embedded by Jupiter (blockhashStr parameter).
+    // Only replace signature[0] (fee payer = wallet); other signers are PDAs via CPI.
     for tx in &mut txs {
-        match &mut tx.message {
-            VersionedMessage::V0(m)     => m.recent_blockhash = blockhash,
-            VersionedMessage::Legacy(m) => m.recent_blockhash = blockhash,
-        }
         let msg_bytes = tx.message.serialize();
         let sig = wallet.sign_message(&msg_bytes);
         if tx.signatures.is_empty() {
@@ -140,9 +138,16 @@ pub async fn wait_for_bundle(
     };
 
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut first = true;
 
     while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // First check after one slot (~500ms); subsequent checks every second.
+        tokio::time::sleep(if first {
+            first = false;
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(1)
+        }).await;
 
         let resp = client
             .post(&status_url)

@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use base64::Engine;
 use reqwest::Client;
 use serde_json::{json, Value};
-use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::{hash::Hash, transaction::VersionedTransaction};
 use std::time::Duration;
 
 const BASE: &str = "https://api.jup.ag/swap/v1";
@@ -62,6 +62,7 @@ pub async fn build_swap_tx(
     user_pubkey:  &str,
     priority_fee: u64,
     api_key:      Option<&str>,
+    blockhash:    Hash,
 ) -> Result<VersionedTransaction> {
     let body = json!({
         "quoteResponse":             quote,
@@ -71,6 +72,8 @@ pub async fn build_swap_tx(
         "prioritizationFeeLamports": priority_fee,
         // skip on-chain account checks — saves 200-500ms per call
         "skipUserAccountsRpcCalls":  true,
+        // embed our pre-fetched blockhash so we don't need to overwrite it later
+        "blockhashStr":              blockhash.to_string(),
     });
 
     for attempt in 0..4u32 {
